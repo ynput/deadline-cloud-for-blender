@@ -22,7 +22,6 @@ from deadline.client.job_bundle.submission import AssetReferences
 from deadline.client.config import get_setting
 
 from . import blender_utils as bu
-from . import sanity_checks as sc
 
 try:
     import bpy
@@ -579,7 +578,11 @@ def get_parameter_values_for_submission(
         The parameter values list ready for serialization.
     """
     common_layer_settings = get_common_layer_settings(settings)
-    return get_parameter_values(settings, common_layer_settings, queue_parameters)
+    return get_parameter_values(
+        settings,
+        common_layer_settings,
+        queue_parameters
+    )
 
 
 def get_asset_references_for_submission(
@@ -608,6 +611,7 @@ def get_common_layer_settings(settings: BlenderSubmitterUISettings) -> CommonLay
     Returns:
         The common layer settings object.
     """
+    settings.output_path = bpy.path.abspath(settings.output_path)
     return CommonLayerSettings(
         renderer_name=settings.renderer_name,
         frame_range=bu.get_frames(),
