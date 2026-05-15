@@ -236,6 +236,7 @@ def get_job_template_for_submission(
     Returns:
         The job template dictionary ready for serialization.
     """
+    setting = _apply_blender_setting(setting)
     common_layer_settings = get_common_layer_settings(setting)
 
     # Add selected layers to the list of layers to render.
@@ -588,7 +589,7 @@ def get_parameter_values_for_submission(
 def get_asset_references_for_submission(
     asset_references: AssetReferences,
 ) -> dict[str, Any]:
-    """Get the asset references in dictionary form for Houdini render submissions.
+    """Get the asset references in dictionary form for Blender render submissions.
 
     This function returns the asset references in their final state, ready to be
     serialized to YAML. It can be used for external integrations.
@@ -629,3 +630,43 @@ def get_common_layer_settings(settings: BlenderSubmitterUISettings) -> CommonLay
         image_height_parameter_name=settings.image_height_parameter_name,
         scene_name=settings.scene_name,
     )
+
+
+def _apply_blender_setting(settings: BlenderSubmitterUISettings) -> BlenderSubmitterUISettings:
+    """Apply a Blender setting for the job template.
+
+    Args:
+        settings: The render submitter UI settings.
+    """
+    settings.name = bu.get_scene_name()
+    settings.project_path = bpy.context.blend_data.filepath
+    settings.frame_list = bu.get_frames()
+
+    # For the output path, first check for a value in the Scene settings
+    if os.path.dirname(bpy.context.scene.render.filepath):
+        settings.output_path = os.path.dirname(bpy.path.abspath(bpy.context.scene.render.filepath))
+    # If none, use the one in Preferences
+    elif bpy.context.preferences.filepaths.render_output_directory:
+        settings.output_path = bpy.context.preferences.filepaths.render_output_directory
+    # If neither of these are set, use the job bundle directory by default
+    else:
+        settings.output_path = os.path.dirname(bpy.context.blend_data.filepath)
+
+    if bpy.path.basename(bpy.context.scene.render.filepath):
+        settings.output_file_prefix = bpy.path.basename(bpy.context.scene.render.filepath)
+
+    # Read the user's preferences to set GPU settings.
+    settings.enable_gpu = bpy.context.scene.cycles.device == "GPU"
+
+    if bpy.context.preferences.addons["cycles"].preferences.compute_device_type != "NONE":
+        settings.gpu_device = bpy.context.preferences.addons[
+            "cycles"
+        ].preferences.compute_device_type
+
+    # Load and set sticky settings, if any.
+    settings.load_sticky_settings(settings.project_path)
+
+    settings.current_layer_selectable_cameras = [settings.camera_selection]
+    settings.all_layer_selectable_cameras = [settings.camera_selection]
+
+    return settings
