@@ -1,6 +1,6 @@
 [envs.default]
 pre-install-commands = [
-  "pip install -r requirements-testing.txt"
+  "pip install -e . -r requirements-testing.txt"
 ]
 
 [envs.default.scripts]

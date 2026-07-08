@@ -12,11 +12,24 @@ import traceback
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import yaml
 from deadline.client.exceptions import DeadlineOperationError
+from deadline.client.api import get_queue_parameter_definitions
 from deadline.client.job_bundle.parameters import JobParameter
+from deadline.client.job_bundle.submission import AssetReferences
+from deadline.client.config import get_setting
+
+from . import blender_utils as bu
+
+try:
+    import bpy
+
+except ImportError:
+    # bpy is not available when running outside of Blender,
+    # so we can ignore the import error in that case.
+    pass
 
 _logger = logging.getLogger(__name__)
 
@@ -151,6 +164,106 @@ class CommonLayerSettings:
     image_height_parameter_name: Optional[str]
     image_resolution: tuple[int, int]
     scene_name: str
+
+
+def get_queue_parameters(
+    farm_id: Optional[str] = None,
+    queue_id: Optional[str] = None,
+    initial_values: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """Get queue parameters from Deadline Cloud for external API usage.
+
+    This function retrieves queue parameter definitions from the Deadline Cloud API
+    and optionally applies initial values. It can be used to construct queue_parameters
+    for get_parameter_values_for_submission() without going through the UI.
+
+    Args:
+        farm_id: The farm ID. If not provided, uses the default from settings.
+        queue_id: The queue ID. If not provided, uses the default from settings.
+        initial_values: Optional dict of {parameter_name: value} to override
+            default parameter values. For example:
+            {"RezPackages": "maya-2024 deadline_cloud_for_maya"}
+
+    Returns:
+        A list of parameter definition dicts with "name" and "value" keys,
+        suitable for passing to get_parameter_values_for_submission().
+
+    Raises:
+        DeadlineOperationError: If farm_id or queue_id are not configured.
+
+    Example:
+        >>> queue_params = get_queue_parameters(
+        ...     initial_values={"RezPackages": "maya-2024"}
+        ... )
+        >>> param_values = get_parameter_values_for_submission(settings, queue_params)
+    """
+    if farm_id is None:
+        farm_id = get_setting("defaults.farm_id")
+    if queue_id is None:
+        queue_id = get_setting("defaults.queue_id")
+
+    if not farm_id or not queue_id:
+        raise DeadlineOperationError(
+            "Farm ID and Queue ID must be configured. "
+            "Either provide them as arguments or configure them in Deadline Cloud settings."
+        )
+
+    # Fetch queue parameter definitions from the API
+    queue_parameters = get_queue_parameter_definitions(farmId=farm_id, queueId=queue_id)
+
+    # Apply initial values if provided
+    if initial_values:
+        for parameter in queue_parameters:
+            if parameter["name"] in initial_values:
+                parameter["value"] = initial_values[parameter["name"]]
+
+    return cast(list[dict[str, Any]], queue_parameters)
+
+
+def get_job_template_for_submission(
+    setting: Any,
+    host_requirements: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Generate the job template for Houdini render submissions.
+
+    This function returns the job template in its final state, ready to be
+    serialized to YAML. It can be used for external integrations.
+
+    Args:
+        node: The Deadline Cloud ROP node to be submitted
+        host_requirements: Optional host requirements to inject into job steps.
+
+    Returns:
+        The job template dictionary ready for serialization.
+    """
+    setting = _apply_blender_setting(setting)
+    common_layer_settings = get_common_layer_settings(setting)
+
+    # Add selected layers to the list of layers to render.
+    layer_names: list[str] = []
+    # Hardcoded to avoid circular import with scene_settings_widget.
+    # COMBO_DEFAULT_ALL_RENDERABLE_LAYERS = "All Renderable Layers"
+    if setting.view_layer_selection == "All Renderable Layers":
+        for layer in bu.get_renderable_view_layers(setting.scene_name):
+            layer_names.append(layer)
+    else:
+        layer_names.append(setting.view_layer_selection)
+
+    # set the frame range to the override value if the override checkbox is enabled
+    if setting.override_frame_range:
+        common_layer_settings.frame_range = setting.frame_list
+
+    job_template = fill_job_template(
+        setting,
+        layer_names,
+        common_layer_settings,
+        host_requirements
+    )
+    if host_requirements:
+        for step in job_template["steps"]:
+            step["hostRequirements"] = host_requirements
+
+    return job_template
 
 
 def fill_job_template(
@@ -437,6 +550,123 @@ def get_parameter_values(
                 pkg for pkg in conda_param["value"].split() if not pkg.startswith("blender-openjd")
             )
 
-    params.extend({"name": param["name"], "value": param["value"]} for param in queue_params)
+    params.extend(
+        {"name": param["name"], "value": param.get("value", param.get("default", ""))}
+        for param in queue_params
+        if "value" in param or "default" in param
+    )
 
     return params
+
+
+def get_parameter_values_for_submission(
+    settings: BlenderSubmitterUISettings,
+    queue_parameters: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Generate the parameter values for Houdini render submissions.
+
+    This function returns the parameter values in their final state, ready to be
+    serialized to YAML. It can be used for external integrations.
+
+    Args:
+        settings: The render submitter UI settings.
+        queue_parameters: Optional queue parameters from the job bundle. These are
+            typically provided by the SubmitJobToDeadlineDialog but can be omitted
+            for external API usage. When omitted, no queue-specific parameters
+            (like RezPackages or CondaPackages) will be included.
+
+    Returns:
+        The parameter values list ready for serialization.
+    """
+    common_layer_settings = get_common_layer_settings(settings)
+    return get_parameter_values(
+        settings,
+        common_layer_settings,
+        queue_parameters
+    )
+
+
+def get_asset_references_for_submission(
+    asset_references: AssetReferences,
+) -> dict[str, Any]:
+    """Get the asset references in dictionary form for Blender render submissions.
+
+    This function returns the asset references in their final state, ready to be
+    serialized to YAML. It can be used for external integrations.
+
+    Args:
+        asset_references: The asset references object.
+
+    Returns:
+        The asset references dictionary ready for serialization.
+    """
+    return asset_references.to_dict()
+
+
+def get_common_layer_settings(settings: BlenderSubmitterUISettings) -> CommonLayerSettings:
+    """Extract the common layer settings from the UI settings.
+
+    Args:
+        settings: The render submitter UI settings.
+
+    Returns:
+        The common layer settings object.
+    """
+    settings.output_path = bpy.path.abspath(settings.output_path)
+    return CommonLayerSettings(
+        renderer_name=settings.renderer_name,
+        frame_range=bu.get_frames(),
+        renderable_camera_names= bu.get_renderable_cameras(settings.scene_name),
+        output_directories=settings.output_path,
+        output_file_prefix=settings.output_file_prefix,
+        image_resolution=(
+            bpy.context.scene.render.resolution_x,
+            bpy.context.scene.render.resolution_y,
+        ),
+        ui_group_label=settings.ui_group_label,
+        frames_parameter_name=settings.frames_parameter_name,
+        output_file_prefix_parameter_name=settings.output_file_prefix_parameter_name,
+        image_width_parameter_name=settings.image_width_parameter_name,
+        image_height_parameter_name=settings.image_height_parameter_name,
+        scene_name=settings.scene_name,
+    )
+
+
+def _apply_blender_setting(settings: BlenderSubmitterUISettings) -> BlenderSubmitterUISettings:
+    """Apply a Blender setting for the job template.
+
+    Args:
+        settings: The render submitter UI settings.
+    """
+    settings.name = bu.get_scene_name()
+    settings.project_path = bpy.context.blend_data.filepath
+    settings.frame_list = bu.get_frames()
+
+    # For the output path, first check for a value in the Scene settings
+    if os.path.dirname(bpy.context.scene.render.filepath):
+        settings.output_path = os.path.dirname(bpy.path.abspath(bpy.context.scene.render.filepath))
+    # If none, use the one in Preferences
+    elif bpy.context.preferences.filepaths.render_output_directory:
+        settings.output_path = bpy.context.preferences.filepaths.render_output_directory
+    # If neither of these are set, use the job bundle directory by default
+    else:
+        settings.output_path = os.path.dirname(bpy.context.blend_data.filepath)
+
+    if bpy.path.basename(bpy.context.scene.render.filepath):
+        settings.output_file_prefix = bpy.path.basename(bpy.context.scene.render.filepath)
+
+    # Read the user's preferences to set GPU settings.
+    settings.enable_gpu = bpy.context.scene.cycles.device == "GPU"
+
+    if bpy.context.preferences.addons["cycles"].preferences.compute_device_type != "NONE":
+        settings.gpu_device = bpy.context.preferences.addons[
+            "cycles"
+        ].preferences.compute_device_type
+
+    # Load and set sticky settings, if any.
+    settings.load_sticky_settings(settings.project_path)
+
+    settings.current_layer_selectable_cameras = [settings.camera_selection]
+    settings.all_layer_selectable_cameras = [settings.camera_selection]
+
+    return settings
